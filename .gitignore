@@ -1,0 +1,14 @@
+/build/
+*.exe
+*.o
+*.gcda
+*.gcno
+*.gcov
+__pycache__/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+.vscode/
+.idea/
