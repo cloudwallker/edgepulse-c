@@ -1,0 +1,40 @@
+name: C core verification
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Strict build and deterministic tests
+        run: make test
+      - name: Address and undefined behavior sanitizers
+        run: make sanitize
+
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: msys2/setup-msys2@v2
+        id: msys2
+        with:
+          msystem: UCRT64
+          update: true
+          install: mingw-w64-ucrt-x86_64-gcc
+      - name: Strict native Windows build and tests
+        shell: pwsh
+        run: ./scripts/build.ps1 -Mode test -Compiler '${{ steps.msys2.outputs.msys2-location }}/ucrt64/bin/gcc.exe'
