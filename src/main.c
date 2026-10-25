@@ -1,7 +1,12 @@
 #include "ep_device.h"
+#include "ep_file_store.h"
 #include <inttypes.h>
 #include <stdio.h>
 #include <string.h>
+#ifdef _WIN32
+#include <stdlib.h>
+#include <windows.h>
+#endif
 
 typedef struct {
     ep_parser wire;
@@ -100,7 +105,7 @@ static void receive_command(void *ctx, const ep_frame *frame) {
     else receiver->valid = false;
 }
 
-static bool send_configuration(ep_device *device, uint32_t *rng, uint32_t *duplicates) {
+static bool send_configuration(ep_device *device, ep_config config, uint32_t *rng, uint32_t *duplicates) {
     uint8_t bytes[EP_FRAME_MAX];
     ep_frame frame = {0};
     ep_parser parser;
@@ -111,8 +116,8 @@ static bool send_configuration(ep_device *device, uint32_t *rng, uint32_t *dupli
     frame.boot = device->boot;
     frame.seq = 42;
     frame.len = 8;
-    put32(frame.payload, 10);
-    put32(frame.payload + 4, 30000);
+    put32(frame.payload, config.period_ms);
+    put32(frame.payload + 4, (uint32_t)config.threshold_mc);
     length = ep_encode(&frame, bytes, sizeof(bytes));
     if (!length) return false;
     ep_parser_init(&parser, receive_command, &receiver);
@@ -141,26 +146,87 @@ static bool parse_number(const char *text, uint32_t minimum, uint32_t maximum, u
 }
 
 static void usage(FILE *stream) {
-    fputs("Usage: edgepulse [--demo] [--seed N] [--ticks N] [--json]\n"
+    fputs("Usage: edgepulse [--demo] [--seed N] [--ticks N] [--json] [--store FILE]\n"
+          "       edgepulse config show FILE\n"
+          "       edgepulse config set FILE PERIOD_MS THRESHOLD_MC\n"
           "  --seed   1..4294967295 (default 20261023)\n"
           "  --ticks  10..1000000 one-millisecond scheduler steps (default 12000)\n"
+          "  --store  load an existing configuration file for this demo\n"
+          "  config   period 10..60000 ms; threshold -40000..125000 mC\n"
           "  --json   print only the machine-readable summary\n"
           "  --help   show this help\n", stream);
 }
 
-int main(int argc, char **argv) {
+static bool parse_threshold(const char *text, int32_t *out) {
+    uint32_t magnitude;
+    const bool negative = text[0] == '-';
+    if (!parse_number(text + (negative ? 1 : 0), 0, negative ? 40000u : 125000u, &magnitude)) return false;
+    *out = negative ? -(int32_t)magnitude : (int32_t)magnitude;
+    return true;
+}
+
+static int storage_error(ep_file_status status) {
+    fprintf(stderr, "Configuration storage error: %s.\n", ep_file_status_string(status));
+    return 1;
+}
+
+static int configuration_cli(int argc, char **argv) {
+    ep_store store;
+    ep_file_store file;
+    ep_config config;
+    uint32_t generation;
+    ep_file_status status;
+    bool set;
+    if (argc < 3) { usage(stderr); return 2; }
+    set = strcmp(argv[2], "set") == 0;
+    if ((!set && strcmp(argv[2], "show") != 0) || argc != (set ? 6 : 4) || !argv[3][0]) {
+        usage(stderr); return 2;
+    }
+    if (set && (!parse_number(argv[4], 10, 60000, &config.period_ms) ||
+                !parse_threshold(argv[5], &config.threshold_mc))) {
+        fputs("Invalid configuration value.\n", stderr); return 2;
+    }
+    status = ep_file_store_open(&file, &store, argv[3], set);
+    if (status != EP_FILE_OK) return storage_error(status);
+    if (set && !ep_store_save(&store, &config, EP_STORE_COMPLETE)) {
+        status = file.status;
+        ep_file_store_close(&file);
+        return storage_error(status);
+    }
+    if (!ep_store_load(&store, &config, &generation)) {
+        ep_file_store_close(&file);
+        return storage_error(EP_FILE_FORMAT);
+    }
+    ep_file_store_close(&file);
+    printf("{\"period_ms\":%" PRIu32 ",\"threshold_mc\":%" PRId32
+           ",\"generation\":%" PRIu32 ",\"persistent\":true}\n",
+           config.period_ms, config.threshold_mc, generation);
+    return 0;
+}
+
+static int run_cli(int argc, char **argv) {
     uint32_t seed = 20261023, ticks = 12000, now = 0, step, duplicates = 0;
     bool json_only = false, command_ok, accounting_ok;
     simulation sim = {0};
     ep_device device;
     ep_store store;
+    ep_file_store file;
+    const char *store_path = NULL;
     ep_hal hal = {sensor_read, link_send, &sim};
     const ep_metrics *metrics = &device.metrics;
     int i;
+    if (argc > 1 && strcmp(argv[1], "config") == 0) return configuration_cli(argc, argv);
     for (i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--help") == 0) { usage(stdout); return 0; }
         if (strcmp(argv[i], "--demo") == 0) continue;
         if (strcmp(argv[i], "--json") == 0) { json_only = true; continue; }
+        if (strcmp(argv[i], "--store") == 0) {
+            if (store_path != NULL || ++i == argc || !argv[i][0] || strncmp(argv[i], "--", 2) == 0) {
+                fputs("Invalid, missing or duplicate storage option.\n", stderr); return 2;
+            }
+            store_path = argv[i];
+            continue;
+        }
         if (strcmp(argv[i], "--seed") == 0 || strcmp(argv[i], "--ticks") == 0) {
             bool is_seed = strcmp(argv[i], "--seed") == 0;
             if (++i == argc || !parse_number(argv[i], is_seed ? 1u : 10u,
@@ -180,9 +246,21 @@ int main(int argc, char **argv) {
     sim.checksum = UINT32_C(2166136261);
     sim.valid = true;
     ep_parser_init(&sim.wire, receive_telemetry, &sim);
-    ep_store_init(&store);
+    if (store_path != NULL) {
+        ep_file_status status = ep_file_store_open(&file, &store, store_path, false);
+        if (status != EP_FILE_OK) return storage_error(status);
+    } else ep_store_init(&store);
     ep_device_init(&device, &store, hal, 7, now);
-    command_ok = send_configuration(&device, &sim.link_rng, &duplicates);
+    command_ok = send_configuration(&device, store_path != NULL ? device.config : (ep_config){10, 30000},
+                                    &sim.link_rng, &duplicates);
+    if (!command_ok) {
+        if (store_path != NULL) {
+            ep_file_status status = file.status;
+            ep_file_store_close(&file);
+            return storage_error(status);
+        }
+        fputs("Configuration command failed.\n", stderr); return 1;
+    }
     for (step = 1; step <= ticks; step++) {
         sim.online = step < ticks / 4u || step >= (ticks * 3u) / 4u;
         /* A single scheduler stall models watchdog detection on the next call. */
@@ -206,11 +284,39 @@ int main(int argc, char **argv) {
         ",\"sensor_errors\":%" PRIu32 ",\"skipped\":%" PRIu32 ",\"resets\":%" PRIu32
         ",\"queue_peak\":%" PRIu32 ",\"commands_applied\":%" PRIu32 ",\"duplicate_commands\":%" PRIu32
         ",\"store_writes\":%" PRIu32 ",\"wire_received\":%" PRIu32 ",\"wire_rejected\":%" PRIu32
-        ",\"telemetry_checksum\":%" PRIu32 ",\"accounting_ok\":%s}\n",
+        ",\"telemetry_checksum\":%" PRIu32 ",\"accounting_ok\":%s"
+        ",\"period_ms\":%" PRIu32 ",\"threshold_mc\":%" PRId32 ",\"persistent\":%s}\n",
         seed, ticks, now, metrics->attempts, metrics->sampled, metrics->sent,
         metrics->dropped, metrics->reset_dropped, device.count, metrics->sensor_errors,
         metrics->skipped_periods, metrics->resets, metrics->queue_peak,
         metrics->commands_applied, duplicates, store.writes, sim.wire_received,
-        sim.wire.rejected, sim.checksum, accounting_ok ? "true" : "false");
+        sim.wire.rejected, sim.checksum, accounting_ok ? "true" : "false",
+        device.config.period_ms, device.config.threshold_mc, store_path != NULL ? "true" : "false");
+    if (store_path != NULL) ep_file_store_close(&file);
     return accounting_ok ? 0 : 1;
 }
+
+#ifdef _WIN32
+/* Windows CRT's narrow argv may lose characters outside the active code page.
+ * Convert the native wide command line to UTF-8 for the portable CLI/backend. */
+int wmain(int argc, wchar_t **wide_argv) {
+    char **argv = calloc((size_t)argc + 1u, sizeof(*argv));
+    int i, result = 1;
+    if (argv == NULL) { fputs("Unable to read command line.\n", stderr); return 1; }
+    for (i = 0; i < argc; i++) {
+        int length = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, wide_argv[i], -1, NULL, 0, NULL, NULL);
+        if (length <= 0 || (argv[i] = malloc((size_t)length)) == NULL ||
+            WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, wide_argv[i], -1, argv[i], length, NULL, NULL) == 0) {
+            fputs("Unable to read command line.\n", stderr);
+            goto cleanup;
+        }
+    }
+    result = run_cli(argc, argv);
+cleanup:
+    for (i = 0; i < argc; i++) free(argv[i]);
+    free(argv);
+    return result;
+}
+#else
+int main(int argc, char **argv) { return run_cli(argc, argv); }
+#endif
