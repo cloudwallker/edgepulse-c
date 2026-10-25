@@ -12,3 +12,5 @@ __pycache__/
 *.key
 .vscode/
 .idea/
+# Local persistent device configuration
+*.epcfg

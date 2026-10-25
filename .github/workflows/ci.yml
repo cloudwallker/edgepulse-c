@@ -16,7 +16,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Strict build and deterministic tests
+      - name: Strict build, deterministic and process-recovery tests
         run: make test
       - name: Address and undefined behavior sanitizers
         run: make sanitize
@@ -35,6 +35,6 @@ jobs:
           msystem: UCRT64
           update: true
           install: mingw-w64-ucrt-x86_64-gcc
-      - name: Strict native Windows build and tests
+      - name: Strict Windows build, Unicode paths and process recovery
         shell: pwsh
         run: ./scripts/build.ps1 -Mode test -Compiler '${{ steps.msys2.outputs.msys2-location }}/ucrt64/bin/gcc.exe'

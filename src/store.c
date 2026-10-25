@@ -47,6 +47,8 @@ void ep_store_init(ep_store *store)
     if (store != NULL) {
         memset(store->slots, 0xff, sizeof(store->slots));
         store->writes = 0u;
+        store->commit = NULL;
+        store->commit_ctx = NULL;
     }
 }
 
@@ -117,7 +119,8 @@ bool ep_store_save(ep_store *store, const ep_config *config, size_t cut_after)
     size_t target;
     size_t bytes_to_write;
     if (store == NULL || !ep_config_valid(config) ||
-        (cut_after != EP_STORE_COMPLETE && cut_after > EP_SLOT_SIZE)) {
+        (cut_after != EP_STORE_COMPLETE && cut_after > EP_SLOT_SIZE) ||
+        (store->commit != NULL && cut_after != EP_STORE_COMPLETE)) {
         return false;
     }
     active = newest_slot(store, &previous, &generation);
@@ -135,6 +138,13 @@ bool ep_store_save(ep_store *store, const ep_config *config, size_t cut_after)
 
     /* Count accepted write attempts, including fault-injected interruptions. */
     ++store->writes;
+    /* An external backend must confirm the whole record before RAM commits.
+     * A failed disk sync may still have reached storage; the backend owns its
+     * unhealthy/reopen policy. Never publish that uncertain result in RAM. */
+    if (store->commit != NULL &&
+        !store->commit(store->commit_ctx, target, record)) {
+        return false;
+    }
     memset(store->slots[target], 0xff, EP_SLOT_SIZE);
     bytes_to_write = cut_after == EP_STORE_COMPLETE ? EP_SLOT_SIZE : cut_after;
     for (size_t i = 0u; i < bytes_to_write; ++i) {

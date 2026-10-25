@@ -9,6 +9,7 @@ static bool sensor(void *ctx, int32_t *value) { fake *f=ctx; *value=31000; retur
 static bool send_frame(void *ctx, const ep_frame *frame) { fake *f=ctx; if(!f->online)return false; f->received++; f->boot=frame->boot; f->seq=frame->seq; assert(frame->payload[8]==1); return true; }
 static void setup(ep_device *d, ep_store *s, fake *f, uint32_t now) { ep_hal hal={sensor,send_frame,f}; ep_store_init(s); ep_device_init(d,s,hal,7,now); }
 static void accounting(const ep_device *d) { assert(d->metrics.sampled==d->metrics.sent+d->metrics.dropped+d->metrics.reset_dropped+d->count); assert(d->metrics.attempts==d->metrics.sampled+d->metrics.sensor_errors); }
+static bool reject_commit(void *ctx, size_t target, const uint8_t record[EP_SLOT_SIZE]) { (void)ctx; (void)target; (void)record; return false; }
 int main(void) {
     ep_device d; ep_store s; fake f={false,false,0,0,0}; uint32_t i;
     setup(&d,&s,&f,0);
@@ -45,5 +46,15 @@ int main(void) {
       cmd.device=8; assert(ep_device_receive(&d,&cmd)==EP_CMD_INVALID); cmd.device=7;
       cmd.type=1; assert(ep_device_receive(&d,&cmd)==EP_CMD_INVALID);
     }
-    puts("device: PASS (queue, accounting, sensor, watchdog, wrap, dedup, wire command)"); return 0;
+    setup(&d,&s,&f,0);
+    { ep_config c={50,28000};
+      s.commit=reject_commit;
+      assert(ep_device_configure(&d,42,c,EP_STORE_COMPLETE)==EP_CMD_STORAGE);
+      assert(d.config.period_ms==100 && d.config.threshold_mc==30000 && d.metrics.commands_applied==0);
+      s.commit=NULL;
+      assert(ep_device_configure(&d,42,c,EP_STORE_COMPLETE)==EP_CMD_OK);
+      assert(ep_device_configure(&d,42,c,EP_STORE_COMPLETE)==EP_CMD_DUPLICATE);
+      assert(d.metrics.commands_applied==1);
+    }
+    puts("device: PASS (queue, accounting, sensor, watchdog, wrap, dedup, wire command, failed commit)"); return 0;
 }

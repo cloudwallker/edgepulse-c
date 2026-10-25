@@ -207,6 +207,55 @@ static bool test_invalid_calls_leave_store_unchanged(void)
     return true;
 }
 
+typedef struct {
+    ep_store *store; uint8_t original[2][EP_SLOT_SIZE];
+    unsigned calls; bool accept;
+} commit_fixture;
+
+static bool observe_commit(void *ctx, size_t target, const uint8_t record[EP_SLOT_SIZE])
+{
+    commit_fixture *f = ctx;
+    ++f->calls;
+    if (memcmp(f->store->slots, f->original, sizeof(f->original)) != 0) return false;
+    if (target != 1u || record[8] != 111u || record[9] != 0u || record[23] != 0xa5u) return false;
+    return f->accept;
+}
+
+static bool test_external_commit_precedes_ram_visibility(void)
+{
+    ep_store store; ep_config old = {100u, 30000}, next = {111u, -1000}, loaded;
+    uint32_t generation;
+    commit_fixture f;
+    ep_store_init(&store);
+    CHECK(ep_store_save(&store, &old, EP_STORE_COMPLETE));
+    f.store = &store; f.calls = 0u; f.accept = false;
+    memcpy(f.original, store.slots, sizeof(f.original));
+    store.commit = observe_commit; store.commit_ctx = &f;
+    CHECK(!ep_store_save(&store, &next, EP_STORE_COMPLETE));
+    CHECK(f.calls == 1u && store.writes == 2u);
+    CHECK(memcmp(store.slots, f.original, sizeof(f.original)) == 0);
+    CHECK(ep_store_load(&store, &loaded, &generation));
+    CHECK(loaded.period_ms == 100u && generation == 1u);
+    CHECK(!ep_store_save(&store, &next, 23u));
+    CHECK(!ep_store_save(&store, &next, 24u));
+    CHECK(f.calls == 1u && store.writes == 2u);
+    f.accept = true;
+    CHECK(ep_store_save(&store, &next, EP_STORE_COMPLETE));
+    CHECK(f.calls == 2u && store.writes == 3u);
+    CHECK(ep_store_load(&store, &loaded, &generation));
+    CHECK(loaded.period_ms == 111u && loaded.threshold_mc == -1000 && generation == 2u);
+    return true;
+}
+
+static bool test_initialization_unbinds_previous_backend(void)
+{
+    ep_store store = {0};
+    store.commit = observe_commit; store.commit_ctx = &store;
+    ep_store_init(&store);
+    CHECK(store.commit == NULL && store.commit_ctx == NULL && store.writes == 0u);
+    return true;
+}
+
 int main(void)
 {
     typedef bool (*test_fn)(void);
@@ -214,12 +263,13 @@ int main(void)
         test_erased_store_defaults, test_config_limits,
         test_first_save_all_cut_points, test_replacement_all_cut_points,
         test_crc_corruption_fallback, test_invalid_record_metadata,
-        test_generation_rollover, test_invalid_calls_leave_store_unchanged
+        test_generation_rollover, test_invalid_calls_leave_store_unchanged,
+        test_external_commit_precedes_ram_visibility, test_initialization_unbinds_previous_backend
     };
     unsigned passed = 0u;
     for (size_t i = 0u; i < sizeof(tests) / sizeof(tests[0]); ++i) {
         if (tests[i]()) { ++passed; }
     }
-    printf("store: %u/8 tests passed; 50 interruption points\n", passed);
-    return passed == 8u ? 0 : 1;
+    printf("store: %u/10 tests passed; 50 interruption points\n", passed);
+    return passed == 10u ? 0 : 1;
 }
