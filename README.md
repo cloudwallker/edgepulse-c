@@ -1,14 +1,14 @@
 # EdgePulse C
 
-A portable C device core with deterministic fault simulation and persistent host configuration.
+A portable C device core with bounded ACK retries, receiver deduplication, deterministic fault simulation and persistent host configuration.
 
-**Build and test an embedded acquisition pipeline without a board, existing firmware, or a virtual machine. Exercise framed communication, bounded queues, configuration recovery across processes and watchdog resets with reproducible inputs.**
+**Build and test an embedded acquisition pipeline without a board, existing firmware, or a virtual machine. Exercise framed communication, acknowledgement loss, bounded retries, duplicate suppression, configuration recovery and watchdog resets with reproducible inputs.**
 
 English | [中文](README_ZH.md)
 
 [Quick start](#quick-start) · [Design](#design) · [Validation](#validation)
 
-![Actual persistent configuration commands and demo output](assets/demo.png)
+![Actual reliable-delivery demo counters and reconciliation](assets/demo.png)
 
 The image lays out actual CLI output; it is not a terminal screenshot.
 
@@ -39,6 +39,15 @@ Run another reproducible scenario:
 ./build/edgepulse.exe --seed 42 --ticks 12000 --json
 ```
 
+Enable receiver acknowledgements and bounded retries:
+
+```powershell
+./build/edgepulse.exe --reliable --demo
+./build/edgepulse.exe --reliable --seed 42 --ticks 12000 --json
+```
+
+`--reliable` is opt-in and works with `--store FILE`. Without it, the original demo and JSON fields retain their existing semantics. Reliable mode injects data/ACK loss, CRC corruption and duplicates into two separately parsed byte streams; ACKs are queued and dispatched after the device tick returns. It is a host simulation, with no real UART or network connection.
+
 Save configuration, read it in another process, and run a demo with those values:
 
 ```powershell
@@ -61,10 +70,11 @@ On Linux, use `./build/edgepulse` with the same arguments. `set` creates a missi
 | `src/protocol.c` | CRC16-CCITT-FALSE, little-endian encoding, an 82-byte stream buffer, fragmented/coalesced input and byte-wise recovery |
 | `src/store.c` | Two 24-byte records, version and CRC validation, last-byte commit, RAM interruption tests, generation rollover and an optional commit callback |
 | `src/file_store.c` | A 48-byte host configuration file, exclusive sessions, three synchronized commit stages and recovery from the remaining valid slot |
-| `src/device.c` | Cooperative sampling, sensor/link HAL callbacks, 16-frame FIFO, reject-new overload policy, retry on reconnection and reset accounting |
-| `src/main.c` | Configuration set/show commands, optional file-backed demos, seeded sensor failures, a link outage, scheduler stall and decoded telemetry reconciliation |
+| `src/device.c` | Cooperative sampling, sensor/link HAL, 16-frame FIFO, overload accounting and optional stop-and-wait ACK/retry state |
+| `src/receiver.c` | Explicit device/boot session, 16-frame duplicate window, serial-number ordering and application acceptance before ACK |
+| `src/main.c` | Configuration commands, optional file-backed/reliable demos, deterministic faults, separate data/ACK parsers and reconciliation |
 
-The protocol, store and device core have no dynamic allocation or OS dependencies. The host CLI and file backend may allocate memory for Windows Unicode conversion. HAL callbacks run serially and must return promptly; no thread or ISR synchronization is provided. Each tick samples at most once and sends at most one queued frame. Missed sampling periods are counted instead of replayed in a burst. Unsigned millisecond arithmetic supports wraparound when adjacent calls are less than 2^31 ms apart.
+The protocol, store, device and receiver core have no dynamic allocation or OS dependencies. The host CLI and file backend may allocate memory for Windows Unicode conversion. HAL and receiver callbacks run serially, must return promptly, and must not re-enter their owner. No thread or ISR synchronization is provided. Each tick samples at most once and makes at most one send HAL call. Missed sampling periods are counted instead of replayed in a burst. Unsigned millisecond arithmetic supports wraparound when adjacent calls are less than 2^31 ms apart.
 
 The threshold produces a telemetry alarm flag. There is no physical actuator driver. A simulated watchdog detects a scheduler gap of at least 5000 ms on the next tick, increments the boot identifier, accounts for discarded queued frames, clears command history and reloads configuration.
 
@@ -82,7 +92,7 @@ All multibyte fields use little endian. Maximum payload length is 64 bytes.
 | 14..15 | Payload length, uint16 |
 | 16.. | Payload, followed by uint16 CRC |
 
-CRC covers version through payload; polynomial 0x1021, initial 0xFFFF, no reflection or final XOR. `123456789` produces 0x29B1. Type 1 telemetry is `timestamp:u32 + temperature_mC:i32 + alarm:u8`. Type 2 configuration is `period_ms:u32 + threshold_mC:i32` and must match the current device and boot ID.
+CRC covers version through payload; polynomial 0x1021, initial 0xFFFF, no reflection or final XOR. `123456789` produces 0x29B1. Type 1 telemetry is `timestamp:u32 + temperature_mC:i32 + alarm:u8`. Type 2 configuration is `period_ms:u32 + threshold_mC:i32` and must match the current device and boot ID. Type 3 is a zero-payload telemetry ACK: its device, boot and sequence fields echo the accepted telemetry. Configuration commands do not use this ACK.
 
 The parser accepts arbitrary transport chunks. On receiver idle/session end, call `ep_parser_flush` to reject an incomplete candidate and recover any complete frames behind it. The parser does not own a clock or enforce an idle timeout itself. CRC detects corruption; it does not authenticate commands.
 
@@ -90,9 +100,35 @@ The parser accepts arbitrary transport chunks. On receiver idle/session end, cal
 
 - Sampling period: 10..60000 ms; threshold: -40000..125000 mC. Core defaults and new file initialization: 100 ms and 30000 mC. The default RAM demo applies 10 ms and 30000 mC; a `--store` demo uses the saved values.
 - A successful configuration is stored before becoming active. The last eight successful command IDs are cached per boot. Same ID and same values return duplicate without writing; different values conflict. Eviction or reboot ends this duplicate protection.
-- A full queue drops the new sample and counts it. A failed link send retains the oldest frame for retry. A successful send only means transfer to the simulated link; there is no receiver ACK, durable telemetry log or exactly-once delivery guarantee.
+- A full queue drops the new sample and counts it. In default mode, a failed send retains the oldest frame; a successful send dequeues it and means only that the simulated link accepted it. Reliable mode retains the head until a matching ACK or an explicit timeout/reset discard. Neither mode persists telemetry.
 - Without `--store`, config slots survive simulated watchdog resets inside one process and are reset to blank RAM on the next process start. The optional file backend preserves configuration across process starts. Its host file protocol does not implement MCU flash erase, timing or wear behavior.
 - Boot IDs and counters are uint32 and wrap. Boot IDs are not persisted across process starts. Applications requiring globally unique sessions must supply a durable boot/session identity.
+
+### Reliable delivery
+
+Call `ep_device_enable_reliable` before sampling, sending or a reset; prior configuration commands are allowed. Enabling it twice or after device activity fails without mutation. The defaults are `EP_ACK_TIMEOUT_MS=100` and `EP_MAX_RETRIES=3`: one initial HAL call and at most three retries for each queue head. Every HAL call consumes the budget, including a `false` return, and subsequent attempts wait at least 100 ms. At the next 100 ms deadline after the fourth call, an unacknowledged head is discarded as `delivery_timeouts`. That tick does not send the next head. Retries preserve the original frame bytes.
+
+An ACK is accepted only for the current head, after at least one successful HAL submission, with type 3, length 0 and exact device/boot/sequence identity. A later failed retry does not invalidate an earlier successful submission. Duplicate, old or mismatched ACKs cannot dequeue another frame. The watchdog clears retry/ACK state and queued samples while retaining reliable mode. ACK input is dispatched outside the send callback, after `ep_device_tick` returns.
+
+The receiver accepts type 1 telemetry with length 9, alarm 0 or 1, and the explicitly selected device/boot identity. `ep_receiver_begin_session` is called by trusted session control; an incoming frame cannot select a new session. It clears history and sequence high-water state while retaining cumulative metrics. The receiver caches 16 complete accepted frames. An identical cached frame is acknowledged again without invoking the delivery callback; changed payload under a cached sequence is a conflict and receives no ACK.
+
+For a sequence outside the cache, unsigned distance from the high-water sequence must satisfy `0 < distance < 2^31`. Gaps and uint32 wrap are supported; older, evicted, equal or exactly half-range sequences are rejected as stale. The first valid sequence in a session is accepted. Only a successful application delivery callback advances history/high-water state and produces an ACK. A failed callback leaves the frame retryable and the ACK output untouched. Side effects performed before returning `false` may repeat; returning `true` means application acceptance, not durable storage.
+
+The reliable JSON fields distinguish the boundaries:
+
+| Field | Meaning |
+| --- | --- |
+| `tx_attempts` / `retransmissions` | All send HAL calls / calls after a head's first attempt, including failed calls |
+| `sent` / `acknowledged` | Heads dequeued by a valid ACK; these are equal in reliable mode |
+| `delivery_timeouts` | Heads discarded after the bounded ACK wait; delivery remains unconfirmed |
+| `wire_transmitted` / `wire_received` | Online encoded telemetry submissions / valid decoded telemetry arrivals, including duplicates |
+| `receiver_unique` / `receiver_duplicates` | Application-accepted new telemetry / cached duplicate arrivals |
+| `invalid_acks` | Decoded ACKs that do not confirm the current eligible head |
+| `data_lost`, `data_corrupted`, `ack_lost`, `ack_rejected` | Injected loss/corruption and ACK parser rejection counters |
+
+The sender reconciles `sampled = sent + dropped + reset_dropped + delivery_timeouts + pending` and `attempts = sampled + sensor_errors`. Raw arrivals reconcile as `wire_received = receiver_unique + receiver_duplicates` in the valid demo. ACK loss can leave `receiver_unique > acknowledged`: a timeout means **unconfirmed delivery**, not proof of non-delivery. Deduplication is volatile and session-scoped; session reset or repeated boot identities can permit redelivery. There is no authentication, durable telemetry log, or end-to-end/cross-process exactly-once guarantee.
+
+Stop-and-wait deliberately limits throughput: a missing ACK holds the queue head while new samples continue arriving, and a failed HAL call still consumes retry time. In the default reliable campaign, 1159 samples reconcile as 86 confirmed, 1027 queue-full drops, 16 reset discards, 14 unconfirmed timeouts and 16 pending. The receiver accepted 87 unique frames and suppressed 38 duplicate arrivals, with 102 retransmissions. The 87-versus-86 difference demonstrates the distinction between application acceptance and sender confirmation. Reliable and default modes inject different faults; these counts are not a controlled packet-loss improvement comparison.
 
 ### Persistent configuration
 
@@ -116,11 +152,13 @@ The process-termination tests check recovery at explicit write/synchronization b
 python scripts/check_mutations.py --compiler gcc
 ```
 
-The normal test entry point runs three C test executables, nine CLI tests and 14 file-backend process tests. Protocol tests reconcile 10000 frames and process 100000 hostile bytes; storage tests cover 50 RAM interruption positions plus the external commit boundary; device tests cover overflow, retries, sensor failure, watchdog reset, tick wrap, duplicate/conflicting commands, wire validation and commit failure. File tests include 27 real process terminations at commit boundaries and 28 injected write/synchronization failures, alongside locking, format and access checks. The mutation test separately checks five intentionally broken variants, three runs each; compilation failures and timeouts are errors, not successful detections.
+The normal test entry point runs five C test executables, 14 CLI tests and 14 file-backend process tests. Protocol tests reconcile 10000 frames and process 100000 hostile bytes; storage tests cover 50 RAM interruption positions plus the external commit boundary; device tests cover overflow, retries, sensor failure, watchdog reset, tick wrap, duplicate/conflicting commands, wire validation and commit failure. Sender and receiver suites add 13 groups each for ACK eligibility, attempt limits, failed-send backoff, reset isolation, duplicate suppression, sequence wrap/eviction, explicit sessions and callback failure. File tests include 27 real process terminations at commit boundaries and 28 injected write/synchronization failures, alongside locking, format and access checks.
 
-The default RAM demo, without `--store`, preserves the compatibility baseline: seed 20261023 produces 1159 successful samples, with 593 delivered, 550 rejected by the full queue, 16 discarded at reset, and 0 pending. There are 40 failed sensor reads. With the saved 25 ms / -12500 mC configuration above, the same seed and tick count produce 463 successful samples: 246 delivered, 201 dropped, 16 discarded at reset, and 0 pending. This intentionally severe outage is a recovery test, not a loss-free throughput benchmark. See the [acceptance report](docs/验收报告.md) for commands, verified results and limits.
+On 2026-10-25, Windows GCC 13.2.0 passed the PowerShell suite and a fresh Make build: protocol 8/8, store 10/10, existing device tests, reliable sender 13/13, receiver 13/13, CLI 14/14, and 13 of 14 file tests with only the POSIX FIFO case skipped. Windows symlink rejection ran successfully. All eight mutation variants were detected in three reproducible runs each, for 24 detections; the added cases cover wrong ACK acceptance, missing retries and duplicate redelivery. Compilation failures and timeouts do not count as detected defects.
 
-On 2026-10-25, Windows GCC 13.2.0 validation passed through both the PowerShell entry point and Make from an empty build directory: protocol 8/8, store 10/10, device tests, CLI 9/9, and 13 of 14 file tests with the POSIX-only FIFO test skipped. Windows symlink rejection was exercised successfully. All 15 mutation runs detected their defects. Linux and ASan/UBSan were not run locally; their results are established by the PR's GitHub Actions checks, not by the workflow definition alone.
+The default RAM demo, without `--store` or `--reliable`, was rechecked against the compatibility baseline: seed 20261023 produces 1159 successful samples, with 593 delivered, 550 rejected by the full queue, 16 discarded at reset, and 0 pending. There are 40 failed sensor reads; the telemetry checksum remains 3411655967. The previously verified 25 ms / -12500 mC default-mode file-backed baseline is also retained in the report: 463 samples, 246 delivered, 201 dropped, 16 reset discards and 0 pending. With both `--store` and `--reliable`, this revision measured 463 samples, 82 confirmed, 84 unique receiver deliveries and 36 duplicate arrivals; configuration values stayed unchanged while generation advanced from 2 to 3. Both reliable demos reported `accounting_ok:true`. See the [acceptance report](docs/验收报告.md) for the complete counters and limits.
+
+The Make run used a fresh `build/reliable-make-check` directory under Windows MSYS2; it is not a Linux runtime test. Linux and ASan/UBSan were not run locally. Remote results are determined by the PR's GitHub Actions checks; the workflow definition alone is not execution evidence.
 
 ## Porting to a board
 

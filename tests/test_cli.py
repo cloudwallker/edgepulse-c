@@ -26,10 +26,21 @@ class SimulatorCLI(unittest.TestCase):
         self.assertTrue(result.stdout.lstrip().startswith("{"), "JSON summary is missing")
         data = json.loads(result.stdout)
         self.assertIs(data["accounting_ok"], True)
-        self.assertEqual(data["sampled"], data["sent"] + data["dropped"] + data["reset_dropped"] + data["pending"])
+        self.assertEqual(data["sampled"], data["sent"] + data["dropped"] + data["reset_dropped"] + data["pending"] + data.get("delivery_timeouts", 0))
         self.assertEqual(data["attempts"], data["sampled"] + data["sensor_errors"])
-        self.assertEqual(data["sent"], data["wire_received"])
-        self.assertEqual(data["wire_rejected"], 0)
+        if data.get("reliable", False):
+            self.assertEqual(data["sent"], data["acknowledged"])
+            self.assertLessEqual(data["acknowledged"], data["receiver_unique"])
+            self.assertEqual(data["wire_received"], data["receiver_unique"] + data["receiver_duplicates"])
+            self.assertEqual(data["ack_received"], data["acknowledged"] + data["invalid_acks"])
+            self.assertGreaterEqual(data["tx_attempts"], data["wire_transmitted"])
+            self.assertLessEqual(data["retransmissions"], data["tx_attempts"])
+            self.assertGreaterEqual(data["wire_rejected"], data["data_corrupted"])
+            self.assertGreaterEqual(data["ack_rejected"], data["ack_corrupted_delivered"])
+            self.assertEqual(data["receiver_rejected"], 0)
+        else:
+            self.assertEqual(data["sent"], data["wire_received"])
+            self.assertEqual(data["wire_rejected"], 0)
         self.assertLessEqual(data["queue_peak"], 16)
         self.assertEqual(data["commands_applied"], 1)
         self.assertEqual(data["duplicate_commands"], 1)
@@ -49,6 +60,53 @@ class SimulatorCLI(unittest.TestCase):
         self.assertEqual(data["period_ms"], 10)
         self.assertEqual(data["threshold_mc"], 30000)
         self.assertIs(data["persistent"], False)
+        self.assertEqual((data["sampled"], data["sent"], data["dropped"], data["telemetry_checksum"]),
+                         (1159, 593, 550, 3411655967))
+
+    def test_reliable_fault_campaign_retries_without_duplicate_delivery(self):
+        data = self.summary("--reliable")
+        self.assertIs(data["reliable"], True)
+        for metric in ("acknowledged", "retransmissions", "delivery_timeouts", "receiver_duplicates",
+                       "invalid_acks", "data_lost", "data_corrupted", "ack_lost", "ack_corrupted_delivered"):
+            self.assertGreater(data[metric], 0, metric)
+        self.assertGreater(data["wire_received"], data["receiver_unique"])
+
+    def test_reliable_seed_reproduces_faults_and_wire_bytes(self):
+        first = self.summary("--reliable", "--seed", "7")
+        self.assertEqual(first, self.summary("--reliable", "--seed", "7"))
+        self.assertNotEqual(first["telemetry_checksum"],
+                            self.summary("--reliable", "--seed", "8")["telemetry_checksum"])
+
+    def test_reliable_short_and_long_campaigns_reconcile(self):
+        for ticks, seed in [("10", "4294967295"), ("1000000", "1")]:
+            data = self.summary("--reliable", "--ticks", ticks, "--seed", seed)
+            self.assertTrue(data["reliable"])
+            self.assertEqual(data["ticks"], int(ticks))
+
+    def test_reliable_mode_uses_persistent_configuration(self):
+        with tempfile.TemporaryDirectory(prefix="ep-cli-", dir=BINARY.parent) as folder:
+            path = Path(folder) / "可靠 配置.epcfg"
+            for period in ("25", "60000"):
+                saved = self.config_result("set", str(path), period, "-12500")
+                data = self.summary("--reliable", "--store", str(path))
+                self.assertTrue(data["reliable"] and data["persistent"])
+                self.assertEqual((data["period_ms"], data["threshold_mc"]), (int(period), -12500))
+                shown = self.config_result("show", str(path))
+                self.assertEqual(shown["generation"], saved["generation"] + 1)
+
+    def test_reliable_option_errors_do_not_touch_storage(self):
+        with tempfile.TemporaryDirectory(prefix="ep-cli-", dir=BINARY.parent) as folder:
+            path = Path(folder) / "keep.epcfg"
+            path.write_bytes(b"keep existing bytes")
+            result = self.run_cli("--reliable", "--reliable", "--store", str(path))
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(result.stdout, "")
+            self.assertEqual(path.read_bytes(), b"keep existing bytes")
+            result = self.run_cli("--reliable", "--store", str(path), "--json")
+            self.assertEqual(result.returncode, 1)
+            self.assertEqual(result.stdout, "")
+            self.assertNotIn(str(path), result.stderr)
+            self.assertEqual(path.read_bytes(), b"keep existing bytes")
 
     def test_seed_reproduces_byte_stream(self):
         first = self.summary("--seed", "7")

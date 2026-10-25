@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build five deliberate C defects in temporary copies and check detection.
+"""Build eight deliberate C defects in temporary copies and check detection.
 
 This is a deterministic regression sensitivity check, not a mutation score
 over all possible defects. Only a successfully compiled test that exits
@@ -28,6 +28,10 @@ SUITES = {
     "device": (
         "src/protocol.c", "src/store.c", "src/device.c", "tests/test_device.c"
     ),
+    "reliable": (
+        "src/protocol.c", "src/store.c", "src/device.c", "tests/test_reliable.c"
+    ),
+    "receiver": ("src/protocol.c", "src/receiver.c", "tests/test_receiver.c"),
 }
 MUTATIONS = (
     {
@@ -69,6 +73,30 @@ MUTATIONS = (
         "old": "memset(store->slots[target], 0xff, EP_SLOT_SIZE);",
         "new": "memset(store->slots[1u - target], 0xff, EP_SLOT_SIZE);",
         "suite": "store",
+    },
+    {
+        "id": "ack_sequence_not_checked",
+        "description": "An ACK for a different sequence can complete the live queue head",
+        "file": "src/device.c",
+        "old": "ack->seq!=head->seq",
+        "new": "(ack->seq!=head->seq && false)",
+        "suite": "reliable",
+    },
+    {
+        "id": "retry_deadline_delayed",
+        "description": "Missing ACKs no longer trigger retries at the required deadline",
+        "file": "src/device.c",
+        "old": "now-d->last_tx<EP_ACK_TIMEOUT_MS",
+        "new": "now-d->last_tx<EP_WATCHDOG_MS",
+        "suite": "reliable",
+    },
+    {
+        "id": "duplicate_telemetry_redelivered",
+        "description": "A valid duplicate repeats the application's delivery side effect",
+        "file": "src/receiver.c",
+        "old": "receiver->metrics.duplicates++;",
+        "new": "receiver->metrics.duplicates++; (void)receiver->deliver(receiver->ctx, frame);",
+        "suite": "receiver",
     },
 )
 
@@ -228,7 +256,7 @@ def main():
                     "passed" if summary["detected"] == len(MUTATIONS) else "failed"
                 )
             else:
-                summary["error"] = "Unmodified baseline must pass all three C test suites"
+                summary["error"] = "Unmodified baseline must pass all C test suites"
     except (OSError, ValueError) as error:
         summary["status"] = "test_error"
         summary["error"] = str(error)

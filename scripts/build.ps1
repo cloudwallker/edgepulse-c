@@ -9,7 +9,7 @@ Push-Location $projectRoot
 try {
     New-Item -ItemType Directory -Force 'build' | Out-Null
     $flags = @('-std=c11', '-Wall', '-Wextra', '-Werror', '-Wpedantic', '-O2', '-g', '-Iinclude')
-    $core = @('src/protocol.c', 'src/store.c', 'src/device.c')
+    $core = @('src/protocol.c', 'src/store.c', 'src/device.c', 'src/receiver.c')
     & $Compiler @flags '-municode' @core 'src/file_store.c' 'src/main.c' '-o' 'build/edgepulse.exe'
     if ($LASTEXITCODE -ne 0) { throw 'Simulator compilation failed.' }
     if ($Mode -eq 'test') {
@@ -20,7 +20,7 @@ if os.name == 'nt':
     ctypes.windll.kernel32.SetErrorMode(0x0002)
 sys.exit(subprocess.run([sys.argv[1]], timeout=60).returncode)
 '@
-        foreach ($name in @('protocol', 'store', 'device')) {
+        foreach ($name in @('protocol', 'store', 'device', 'reliable', 'receiver')) {
             $source = "tests/test_$name.c"
             $binary = "build/test_$name.exe"
             & $Compiler @flags @core $source '-o' $binary
