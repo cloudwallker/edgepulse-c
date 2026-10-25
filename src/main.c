@@ -1,5 +1,6 @@
 #include "ep_device.h"
 #include "ep_file_store.h"
+#include "ep_receiver.h"
 #include <inttypes.h>
 #include <stdio.h>
 #include <string.h>
@@ -8,12 +9,22 @@
 #include <windows.h>
 #endif
 
+#define SIM_ACK_CAP 8u
+typedef struct { ep_frame frame; uint32_t due; bool corrupt, duplicate; } queued_ack;
+
 typedef struct {
     ep_parser wire;
+    ep_parser ack_wire;
+    ep_receiver receiver;
+    ep_device *device;
+    queued_ack acks[SIM_ACK_CAP];
+    size_t ack_head, ack_count;
     ep_frame expected;
     uint32_t sensor_rng, link_rng, wire_received, checksum;
     uint32_t last_boot, last_seq;
-    bool online, expecting, valid, have_last;
+    uint32_t now, fault_phase, wire_transmitted, data_lost, data_corrupted;
+    uint32_t ack_generated, ack_lost, ack_corrupted_delivered;
+    bool online, expecting, valid, have_last, reliable;
 } simulation;
 
 typedef struct {
@@ -44,9 +55,41 @@ static bool sensor_read(void *ctx, int32_t *temperature) {
     return true;
 }
 
+static bool deliver_telemetry(void *ctx, const ep_frame *frame) {
+    simulation *sim = ctx;
+    const ep_frame *expected = &sim->expected;
+    bool equal = sim->expecting && frame->device == expected->device &&
+        frame->boot == expected->boot && frame->seq == expected->seq &&
+        frame->len == 9 && memcmp(frame->payload, expected->payload, 9) == 0;
+    if (!equal) sim->valid = false;
+    return equal;
+}
+
+static void queue_ack(simulation *sim, const ep_frame *ack) {
+    uint32_t ticket = ++sim->ack_generated + sim->fault_phase;
+    queued_ack *pending;
+    if (ticket % 5u == 1u) { sim->ack_lost++; return; }
+    if (sim->ack_count == SIM_ACK_CAP) { sim->valid = false; return; }
+    pending = &sim->acks[(sim->ack_head + sim->ack_count) % SIM_ACK_CAP];
+    pending->frame = *ack;
+    pending->due = sim->now + 2u;
+    pending->corrupt = ticket % 13u == 2u;
+    pending->duplicate = !pending->corrupt && ticket % 8u == 0u;
+    sim->ack_count++;
+}
+
 static void receive_telemetry(void *ctx, const ep_frame *frame) {
     simulation *sim = ctx;
     const ep_frame *expected = &sim->expected;
+    if (sim->reliable) {
+        ep_frame ack;
+        ep_receive_result result;
+        sim->wire_received++;
+        result = ep_receiver_receive(&sim->receiver, frame, &ack);
+        if (result == EP_RX_NEW || result == EP_RX_DUPLICATE) queue_ack(sim, &ack);
+        else sim->valid = false;
+        return;
+    }
     if (!sim->expecting || frame->type != 1 || frame->len != 9 ||
         frame->device != expected->device || frame->boot != expected->boot ||
         frame->seq != expected->seq || frame->len != expected->len ||
@@ -74,6 +117,29 @@ static void fragmented_feed(ep_parser *parser, const uint8_t *bytes, size_t leng
     }
 }
 
+static void receive_ack(void *ctx, const ep_frame *frame) {
+    simulation *sim = ctx;
+    /* Duplicate or delayed ACKs are expected; only the exact live head can pop. */
+    (void)ep_device_acknowledge(sim->device, frame);
+}
+
+static void deliver_due_acks(simulation *sim) {
+    while (sim->ack_count && (uint32_t)(sim->now - sim->acks[sim->ack_head].due) < UINT32_C(0x80000000)) {
+        queued_ack pending = sim->acks[sim->ack_head];
+        uint8_t bytes[EP_FRAME_MAX];
+        size_t length;
+        sim->ack_head = (sim->ack_head + 1u) % SIM_ACK_CAP;
+        sim->ack_count--;
+        if (!sim->online) { sim->ack_lost++; continue; }
+        length = ep_encode(&pending.frame, bytes, sizeof(bytes));
+        if (!length) { sim->valid = false; continue; }
+        if (pending.corrupt) { bytes[length - 1u] ^= 1u; sim->ack_corrupted_delivered++; }
+        fragmented_feed(&sim->ack_wire, bytes, length, &sim->link_rng);
+        if (pending.duplicate) fragmented_feed(&sim->ack_wire, bytes, length, &sim->link_rng);
+        ep_parser_flush(&sim->ack_wire); /* Explicit simulated packet-idle boundary. */
+    }
+}
+
 static bool link_send(void *ctx, const ep_frame *frame) {
     simulation *sim = ctx;
     uint8_t bytes[EP_FRAME_MAX];
@@ -91,6 +157,17 @@ static bool link_send(void *ctx, const ep_frame *frame) {
     for (i = 0; i < length; i++) {
         sim->checksum ^= bytes[i];
         sim->checksum *= UINT32_C(16777619);
+    }
+    if (sim->reliable) {
+        uint32_t ticket = ++sim->wire_transmitted + sim->fault_phase;
+        if (ticket % 7u == 1u) { sim->data_lost++; sim->expecting = false; return true; }
+        if (ticket % 11u == 2u) { bytes[length - 1u] ^= 1u; sim->data_corrupted++; }
+        fragmented_feed(&sim->wire, bytes, length, &sim->link_rng);
+        if (ticket % 11u != 2u && ticket % 9u == 0u)
+            fragmented_feed(&sim->wire, bytes, length, &sim->link_rng);
+        ep_parser_flush(&sim->wire);
+        sim->expecting = false;
+        return true; /* Link acceptance deliberately does not promise delivery. */
     }
     fragmented_feed(&sim->wire, bytes, length, &sim->link_rng);
     if (sim->expecting || sim->wire_received != before + 1u) sim->valid = false;
@@ -146,12 +223,13 @@ static bool parse_number(const char *text, uint32_t minimum, uint32_t maximum, u
 }
 
 static void usage(FILE *stream) {
-    fputs("Usage: edgepulse [--demo] [--seed N] [--ticks N] [--json] [--store FILE]\n"
+    fputs("Usage: edgepulse [--demo] [--seed N] [--ticks N] [--json] [--store FILE] [--reliable]\n"
           "       edgepulse config show FILE\n"
           "       edgepulse config set FILE PERIOD_MS THRESHOLD_MC\n"
           "  --seed   1..4294967295 (default 20261023)\n"
           "  --ticks  10..1000000 one-millisecond scheduler steps (default 12000)\n"
           "  --store  load an existing configuration file for this demo\n"
+          "  --reliable  require ACKs; retry at 100 ms, up to three retries\n"
           "  config   period 10..60000 ms; threshold -40000..125000 mC\n"
           "  --json   print only the machine-readable summary\n"
           "  --help   show this help\n", stream);
@@ -206,7 +284,7 @@ static int configuration_cli(int argc, char **argv) {
 
 static int run_cli(int argc, char **argv) {
     uint32_t seed = 20261023, ticks = 12000, now = 0, step, duplicates = 0;
-    bool json_only = false, command_ok, accounting_ok;
+    bool json_only = false, reliable = false, command_ok, accounting_ok;
     simulation sim = {0};
     ep_device device;
     ep_store store;
@@ -220,6 +298,11 @@ static int run_cli(int argc, char **argv) {
         if (strcmp(argv[i], "--help") == 0) { usage(stdout); return 0; }
         if (strcmp(argv[i], "--demo") == 0) continue;
         if (strcmp(argv[i], "--json") == 0) { json_only = true; continue; }
+        if (strcmp(argv[i], "--reliable") == 0) {
+            if (reliable) { fputs("Duplicate reliability option.\n", stderr); return 2; }
+            reliable = true;
+            continue;
+        }
         if (strcmp(argv[i], "--store") == 0) {
             if (store_path != NULL || ++i == argc || !argv[i][0] || strncmp(argv[i], "--", 2) == 0) {
                 fputs("Invalid, missing or duplicate storage option.\n", stderr); return 2;
@@ -245,12 +328,21 @@ static int run_cli(int argc, char **argv) {
     sim.link_rng = seed;
     sim.checksum = UINT32_C(2166136261);
     sim.valid = true;
+    sim.reliable = reliable;
+    sim.fault_phase = seed % 97u;
+    sim.device = &device;
     ep_parser_init(&sim.wire, receive_telemetry, &sim);
+    ep_parser_init(&sim.ack_wire, receive_ack, &sim);
     if (store_path != NULL) {
         ep_file_status status = ep_file_store_open(&file, &store, store_path, false);
         if (status != EP_FILE_OK) return storage_error(status);
     } else ep_store_init(&store);
     ep_device_init(&device, &store, hal, 7, now);
+    ep_receiver_init(&sim.receiver, device.device, device.boot, deliver_telemetry, &sim);
+    if (reliable && !ep_device_enable_reliable(&device)) {
+        if (store_path != NULL) ep_file_store_close(&file);
+        fputs("Unable to enable reliable delivery.\n", stderr); return 1;
+    }
     command_ok = send_configuration(&device, store_path != NULL ? device.config : (ep_config){10, 30000},
                                     &sim.link_rng, &duplicates);
     if (!command_ok) {
@@ -266,17 +358,31 @@ static int run_cli(int argc, char **argv) {
         /* A single scheduler stall models watchdog detection on the next call. */
         if (step == ticks / 2u) now += EP_WATCHDOG_MS;
         now++;
+        sim.now = now;
         ep_device_tick(&device, now);
+        if (reliable) {
+            if (sim.receiver.boot != device.boot) ep_receiver_begin_session(&sim.receiver, device.boot);
+            /* Dispatch after tick/send returns; callbacks never reenter the device. */
+            deliver_due_acks(&sim);
+        }
     }
-    accounting_ok = command_ok && sim.valid && sim.wire.used == 0 &&
-        sim.wire.rejected == 0 && metrics->sent == sim.wire_received &&
-        metrics->sampled == metrics->sent + metrics->dropped + metrics->reset_dropped + device.count &&
+    accounting_ok = command_ok && sim.valid && sim.wire.used == 0 && sim.ack_wire.used == 0 &&
+        metrics->sampled == metrics->sent + metrics->dropped + metrics->reset_dropped + metrics->delivery_timeouts + device.count &&
         metrics->attempts == metrics->sampled + metrics->sensor_errors &&
         metrics->commands_applied == 1 && store.writes == 1 && metrics->resets == 1;
+    if (reliable) {
+        accounting_ok = accounting_ok && metrics->sent == metrics->acknowledged &&
+            metrics->acknowledged <= sim.receiver.metrics.accepted &&
+            sim.wire_received == sim.receiver.metrics.accepted + sim.receiver.metrics.duplicates &&
+            sim.ack_wire.accepted == metrics->acknowledged + metrics->invalid_acks &&
+            sim.receiver.metrics.conflicts == 0 && sim.receiver.metrics.stale == 0 &&
+            sim.receiver.metrics.invalid == 0 && sim.receiver.metrics.delivery_failures == 0;
+    } else accounting_ok = accounting_ok && sim.wire.rejected == 0 && metrics->sent == sim.wire_received;
     if (!json_only) {
         puts("EdgePulse C | deterministic host simulation");
         puts("Scenario: framed config + duplicate, sensor faults, link outage, watchdog stall, reconnect.");
         puts("One scheduler step = 1 ms; the injected stall adds 5000 ms. No real hardware is used.");
+        if (reliable) puts("Reliable mode: data/ACK loss, CRC corruption, duplication and deferred ACKs; expiry means unconfirmed delivery.");
     }
     printf("{\"seed\":%" PRIu32 ",\"ticks\":%" PRIu32 ",\"simulated_ms\":%" PRIu32
         ",\"attempts\":%" PRIu32 ",\"sampled\":%" PRIu32 ",\"sent\":%" PRIu32
@@ -285,13 +391,27 @@ static int run_cli(int argc, char **argv) {
         ",\"queue_peak\":%" PRIu32 ",\"commands_applied\":%" PRIu32 ",\"duplicate_commands\":%" PRIu32
         ",\"store_writes\":%" PRIu32 ",\"wire_received\":%" PRIu32 ",\"wire_rejected\":%" PRIu32
         ",\"telemetry_checksum\":%" PRIu32 ",\"accounting_ok\":%s"
-        ",\"period_ms\":%" PRIu32 ",\"threshold_mc\":%" PRId32 ",\"persistent\":%s}\n",
+        ",\"period_ms\":%" PRIu32 ",\"threshold_mc\":%" PRId32 ",\"persistent\":%s",
         seed, ticks, now, metrics->attempts, metrics->sampled, metrics->sent,
         metrics->dropped, metrics->reset_dropped, device.count, metrics->sensor_errors,
         metrics->skipped_periods, metrics->resets, metrics->queue_peak,
         metrics->commands_applied, duplicates, store.writes, sim.wire_received,
         sim.wire.rejected, sim.checksum, accounting_ok ? "true" : "false",
         device.config.period_ms, device.config.threshold_mc, store_path != NULL ? "true" : "false");
+    if (reliable) {
+        printf(",\"reliable\":true,\"tx_attempts\":%" PRIu32 ",\"retransmissions\":%" PRIu32
+            ",\"acknowledged\":%" PRIu32 ",\"delivery_timeouts\":%" PRIu32 ",\"invalid_acks\":%" PRIu32
+            ",\"wire_transmitted\":%" PRIu32 ",\"receiver_unique\":%" PRIu32 ",\"receiver_duplicates\":%" PRIu32
+            ",\"receiver_rejected\":%" PRIu32 ",\"data_lost\":%" PRIu32 ",\"data_corrupted\":%" PRIu32
+            ",\"ack_lost\":%" PRIu32 ",\"ack_received\":%" PRIu32 ",\"ack_rejected\":%" PRIu32
+            ",\"ack_corrupted_delivered\":%" PRIu32 ",\"pending_acks\":%zu",
+            metrics->tx_attempts, metrics->retransmissions, metrics->acknowledged, metrics->delivery_timeouts,
+            metrics->invalid_acks, sim.wire_transmitted, sim.receiver.metrics.accepted, sim.receiver.metrics.duplicates,
+            sim.receiver.metrics.invalid + sim.receiver.metrics.conflicts + sim.receiver.metrics.stale + sim.receiver.metrics.delivery_failures,
+            sim.data_lost, sim.data_corrupted, sim.ack_lost, sim.ack_wire.accepted, sim.ack_wire.rejected,
+            sim.ack_corrupted_delivered, sim.ack_count);
+    }
+    puts("}");
     if (store_path != NULL) ep_file_store_close(&file);
     return accounting_ok ? 0 : 1;
 }

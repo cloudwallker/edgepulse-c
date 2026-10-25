@@ -3,10 +3,10 @@ PYTHON ?= python3
 BUILD_DIR ?= build
 CFLAGS ?= -O2 -g
 STRICT = -std=c11 -Wall -Wextra -Werror -Wpedantic -Iinclude
-CORE = src/protocol.c src/store.c src/device.c
+CORE = src/protocol.c src/store.c src/device.c src/receiver.c
 FILE_BACKEND = src/file_store.c
-HEADERS = include/ep_protocol.h include/ep_store.h include/ep_device.h include/ep_file_store.h
-TESTS = $(BUILD_DIR)/test_protocol $(BUILD_DIR)/test_store $(BUILD_DIR)/test_device
+HEADERS = include/ep_protocol.h include/ep_store.h include/ep_device.h include/ep_file_store.h include/ep_receiver.h
+TESTS = $(BUILD_DIR)/test_protocol $(BUILD_DIR)/test_store $(BUILD_DIR)/test_device $(BUILD_DIR)/test_reliable $(BUILD_DIR)/test_receiver
 WINDOWS_ENTRY =
 TARGET_MACHINE := $(shell $(CC) -dumpmachine)
 ifneq (,$(findstring mingw,$(TARGET_MACHINE)))
@@ -32,6 +32,8 @@ test: $(BUILD_DIR)/edgepulse $(TESTS) $(BUILD_DIR)/file_store_worker
 	$(BUILD_DIR)/test_protocol
 	$(BUILD_DIR)/test_store
 	$(BUILD_DIR)/test_device
+	$(BUILD_DIR)/test_reliable
+	$(BUILD_DIR)/test_receiver
 	$(PYTHON) tests/test_cli.py $(BUILD_DIR)/edgepulse
 	$(PYTHON) tests/test_file_store.py $(BUILD_DIR)/file_store_worker
 
